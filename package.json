@@ -1,0 +1,22 @@
+{
+  "name": "job-pilot-data",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:all": "playwright test",
+    "test:jobscall": "playwright test playwright-scripts/jobscall.spec.ts",
+    "test:ui": "playwright test --ui"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@playwright/test": "^1.55.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0"
+  }
+}
