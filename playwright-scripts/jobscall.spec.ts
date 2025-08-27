@@ -8,6 +8,8 @@ interface JobData {
     company: string;
     postDate: string;
     description: string;
+    jobUrl: string;
+    source: string;
 }
 
 test('Enhanced JobsCall.me Multi-Job Crawler', async ({ page }) => {
@@ -48,12 +50,14 @@ test('Enhanced JobsCall.me Multi-Job Crawler', async ({ page }) => {
       await page.goto(fullUrl, { waitUntil: 'domcontentloaded' });
       
       // Extract job data with company information
-      const jobsFromPage = await page.evaluate(() => {
+      const jobsFromPage = await page.evaluate((currentUrl: string) => {
         interface JobData {
             title: string;
             company: string;
             postDate: string;
             description: string;
+            jobUrl: string;
+            source: string;
         }
 
         const jobs: JobData[] = [];
@@ -121,7 +125,9 @@ test('Enhanced JobsCall.me Multi-Job Crawler', async ({ page }) => {
                         title: currentJob.title,
                         company: currentJob.company,
                         postDate: currentJob.postDate,
-                        description: currentJob.descriptionParts.join('\n\n').trim()
+                        description: currentJob.descriptionParts.join('\n\n').trim(),
+                        jobUrl: currentUrl,
+                        source: 'jobscallme'
                     });
                 }
                 currentJob = {
@@ -140,12 +146,14 @@ test('Enhanced JobsCall.me Multi-Job Crawler', async ({ page }) => {
                 title: currentJob.title,
                 company: currentJob.company,
                 postDate: currentJob.postDate,
-                description: currentJob.descriptionParts.join('\n\n').trim()
+                description: currentJob.descriptionParts.join('\n\n').trim(),
+                jobUrl: currentUrl,
+                source: 'jobscallme'
             });
         }
 
         return jobs;
-      });
+      }, fullUrl);
       
       if (jobsFromPage.length > 0) {
         jobsData.push(...jobsFromPage);
@@ -163,15 +171,14 @@ test('Enhanced JobsCall.me Multi-Job Crawler', async ({ page }) => {
   
   // Save data
   const now = new Date();
-  const timestamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+  const timestamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
   const outputDir = path.join(process.cwd(), 'job-data', timestamp);
   
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
   
-  const jsonPath = path.join(outputDir, `jobscall-${timestamp}.json`);
-  fs.writeFileSync(jsonPath, JSON.stringify(jobsData, null, 2), 'utf8');
+
   
   const csvFiles: string[] = [];
   jobsData.forEach((job, index) => {
@@ -196,7 +203,9 @@ test('Enhanced JobsCall.me Multi-Job Crawler', async ({ page }) => {
       `"Title","${job.title.replace(/"/g, '""')}"`,
       `"Company","${job.company.replace(/"/g, '""')}"`,
       `"Post Date","${job.postDate.replace(/"/g, '""')}"`,
-      `"Description","${job.description.replace(/"/g, '""').replace(/\n/g, ' | ')}"`
+      `"Description","${job.description.replace(/"/g, '""').replace(/\n/g, ' | ')}"`,
+      `"Job URL","${job.jobUrl.replace(/"/g, '""')}"`,
+      `"Source","${job.source.replace(/"/g, '""')}"`
     ].join('\n');
     
     // Write with explicit UTF-8 BOM for better Chinese character support
@@ -208,7 +217,6 @@ test('Enhanced JobsCall.me Multi-Job Crawler', async ({ page }) => {
   console.log(`\n✅ Crawling completed!`);
   console.log(`📊 Total jobs crawled: ${jobsData.length}`);
   console.log(`📁 Files saved in '${outputDir}':`);
-  console.log(`   - JSON (master): ${path.basename(jsonPath)}`);
   console.log(`   - Individual CSV files: ${csvFiles.length} files`);
   
   expect(jobsData.length).toBeGreaterThan(0);
