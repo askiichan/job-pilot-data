@@ -232,14 +232,16 @@ class JobscallMeCrawler:
         today = datetime.datetime.now()
         date_folder = today.strftime("%Y%m%d")
         
-        # Create directory structure
+        # Create directory structure (with new folder structure: job-data/{YYYYMMDD}/jobscallme/)
         script_dir = os.path.dirname(os.path.abspath(__file__))
         date_dir = os.path.join(script_dir, "job-data", date_folder)
-        html_dir = os.path.join(date_dir, "html")
-        md_dir = os.path.join(date_dir, "markdown")
+        jobscallme_dir = os.path.join(date_dir, "jobscallme")
+        html_dir = os.path.join(jobscallme_dir, "html")
+        md_dir = os.path.join(jobscallme_dir, "markdown")
         
         # Create directories if they don't exist
         os.makedirs(date_dir, exist_ok=True)
+        os.makedirs(jobscallme_dir, exist_ok=True)
         os.makedirs(html_dir, exist_ok=True)
         os.makedirs(md_dir, exist_ok=True)
         
@@ -339,8 +341,8 @@ class JobscallMeCrawler:
                 }, f, indent=2, ensure_ascii=False)
             
             print(f"💾 Scraping summary saved to: {summary_file}")
-            print(f"📁 HTML files saved in: {os.path.join(date_dir, 'html')}")
-            print(f"📁 Markdown files saved in: {os.path.join(date_dir, 'markdown')}")
+            print(f"📁 HTML files saved in: {os.path.join(date_dir, 'jobscallme', 'html')}")
+            print(f"📁 Markdown files saved in: {os.path.join(date_dir, 'jobscallme', 'markdown')}")
 
 
 def get_api_key() -> Optional[str]:
@@ -386,9 +388,9 @@ def main():
     print(f"📊 Summary:")
     print(f"   - Discovered links: {len(links)}")
     print(f"   - Successfully scraped: {len(scraped_jobs)} jobs")
-    print(f"   - HTML and Markdown files saved in: job-data/{date_folder}")
-    print(f"   - HTML files: job-data/{date_folder}/html/")
-    print(f"   - Markdown files: job-data/{date_folder}/markdown/")
+    print(f"   - HTML and Markdown files saved in: job-data/{date_folder}/jobscallme/")
+    print(f"   - HTML files: job-data/{date_folder}/jobscallme/html/")
+    print(f"   - Markdown files: job-data/{date_folder}/jobscallme/markdown/")
 
 
 if __name__ == "__main__":

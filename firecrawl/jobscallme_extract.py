@@ -116,8 +116,8 @@ async def save_job_data_as_json_async(jobs_data: JobsExtraction, markdown_file_p
     # Get the filename without extension from the markdown file
     md_filename = Path(markdown_file_path).stem
     
-    # Create the output directory structure (relative to firecrawl directory)
-    output_dir = Path("firecrawl/job-data") / today / "json"
+    # Create the output directory structure (with new folder structure: job-data/{YYYYMMDD}/jobscallme/)
+    output_dir = Path("firecrawl/job-data") / today / "jobscallme" / "json"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Create the output file path
@@ -182,7 +182,7 @@ async def process_multiple_files_async(markdown_dir: str, api_key: str, max_conc
                 
                 # The JSON file path is built in save_job_data_as_json
                 today = datetime.now().strftime("%Y%m%d")
-                json_path = f"firecrawl/job-data/{today}/json/{md_file.stem}.json"
+                json_path = f"firecrawl/job-data/{today}/jobscallme/json/{md_file.stem}.json"
                 
                 print(f"✅ Completed: {md_file.name} - Found {jobs_data.total_jobs} job(s)")
                 return json_path, True, ""
@@ -249,8 +249,8 @@ def process_batch_files(date_str: str = None, api_key: str = None) -> None:
     if not date_str:
         date_str = datetime.now().strftime("%Y%m%d")
     
-    # Directory containing markdown files (relative to firecrawl directory)
-    markdown_dir = f"firecrawl/job-data/{date_str}/markdown"
+    # Directory containing markdown files (with new folder structure)
+    markdown_dir = f"firecrawl/job-data/{date_str}/jobscallme/markdown"
     
     # Check if the directory exists
     if not os.path.exists(markdown_dir):
@@ -279,10 +279,10 @@ def process_batch_files(date_str: str = None, api_key: str = None) -> None:
     print("\n" + "=" * 60)
     print("🎉 PARALLEL BATCH PROCESSING COMPLETE")
     print(f"✅ Successfully processed: {len(successful_files)} files")
-    print(f"💾 JSON files saved to: firecrawl/job-data/{date_str}/json/")
+    print(f"💾 JSON files saved to: firecrawl/job-data/{date_str}/jobscallme/json/")
     
     if successful_files:
-        print(f"\n📊 Check the JSON files in: firecrawl/job-data/{date_str}/json/")
+        print(f"\n📊 Check the JSON files in: firecrawl/job-data/{date_str}/jobscallme/json/")
 
 def process_single_file(file_path: str, api_key: str = None) -> None:
     """
@@ -331,7 +331,7 @@ Examples (run from project root directory):
   python firecrawl/jobscallme_extract.py --date 20250828 --max-concurrent 10
 
   # Process a single file
-  python firecrawl/jobscallme_extract.py --file firecrawl/job-data/20250828/markdown/bigfour-admin.md
+  python firecrawl/jobscallme_extract.py --file firecrawl/job-data/20250828/jobscallme/markdown/bigfour-admin.md
 
   # Process with custom API key and reduced concurrency for rate limiting
   python firecrawl/jobscallme_extract.py --api-key YOUR_API_KEY --max-concurrent 3
