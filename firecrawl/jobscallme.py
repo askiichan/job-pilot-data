@@ -4,6 +4,7 @@ import datetime
 from typing import Dict, List, Optional
 from firecrawl import Firecrawl
 from bs4 import BeautifulSoup
+import html2text
 
 
 class JobscallMeCrawler:
@@ -189,9 +190,31 @@ class JobscallMeCrawler:
             print(f"❌ Failed to scrape {url}: {str(e)}")
             return None
     
+    def html_to_markdown(self, html_content: str) -> str:
+        """
+        Convert HTML content to Markdown
+        
+        Args:
+            html_content (str): HTML content to convert
+            
+        Returns:
+            str: Converted Markdown content
+        """
+        # Configure html2text
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.ignore_tables = False
+        h.body_width = 0  # Don't wrap text at a certain width
+        
+        # Convert HTML to Markdown
+        markdown_content = h.handle(html_content)
+        
+        return markdown_content
+    
     def scrape_all_jobs(self, job_links: List[str], max_jobs: int = 500) -> List[Dict]:
         """
-        Scrape all discovered job pages and save as HTML files
+        Scrape all discovered job pages and save as HTML and Markdown files
         
         Args:
             job_links (List[str]): List of job URLs to scrape
@@ -213,10 +236,12 @@ class JobscallMeCrawler:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         date_dir = os.path.join(script_dir, "job-data", date_folder)
         html_dir = os.path.join(date_dir, "html")
+        md_dir = os.path.join(date_dir, "markdown")
         
         # Create directories if they don't exist
         os.makedirs(date_dir, exist_ok=True)
         os.makedirs(html_dir, exist_ok=True)
+        os.makedirs(md_dir, exist_ok=True)
         
         for i, job_url in enumerate(jobs_to_scrape, 1):
             print(f"\n[{i}/{len(jobs_to_scrape)}] Processing: {job_url}")
@@ -225,20 +250,29 @@ class JobscallMeCrawler:
             if result and isinstance(result, dict) and result.get('html_content'):
                 # Extract filename from URL path
                 url_path = job_url.split('/job/')[-1] if '/job/' in job_url else f"job_{i}"
-                filename = f"{url_path}.html"
-                
-                # Save HTML content to date-based directory
-                output_file = os.path.join(html_dir, filename)
+                html_filename = f"{url_path}.html"
+                md_filename = f"{url_path}.md"
                 
                 html_content = result['html_content']
-                with open(output_file, 'w', encoding='utf-8') as f:
+                
+                # Save HTML content
+                html_output_file = os.path.join(html_dir, html_filename)
+                with open(html_output_file, 'w', encoding='utf-8') as f:
                     f.write(html_content)
+                
+                # Convert to Markdown and save
+                markdown_content = self.html_to_markdown(html_content)
+                md_output_file = os.path.join(md_dir, md_filename)
+                with open(md_output_file, 'w', encoding='utf-8') as f:
+                    f.write(markdown_content)
                 
                 # Create job info with metadata
                 job_info = {
                     "url": job_url,
-                    "filename": filename,
-                    "content_length": len(html_content),
+                    "html_filename": html_filename,
+                    "md_filename": md_filename,
+                    "html_length": len(html_content),
+                    "md_length": len(markdown_content),
                     "article_found": result.get('article_found', False)
                 }
                 
@@ -248,7 +282,8 @@ class JobscallMeCrawler:
                 
                 scraped_jobs.append(job_info)
                 
-                print(f"✅ Saved: {filename}")
+                print(f"✅ Saved HTML: {html_filename}")
+                print(f"✅ Saved Markdown: {md_filename}")
             else:
                 print(f"❌ Failed to extract HTML content from: {job_url}")
         
@@ -305,6 +340,7 @@ class JobscallMeCrawler:
             
             print(f"💾 Scraping summary saved to: {summary_file}")
             print(f"📁 HTML files saved in: {os.path.join(date_dir, 'html')}")
+            print(f"📁 Markdown files saved in: {os.path.join(date_dir, 'markdown')}")
 
 
 def get_api_key() -> Optional[str]:
@@ -350,7 +386,9 @@ def main():
     print(f"📊 Summary:")
     print(f"   - Discovered links: {len(links)}")
     print(f"   - Successfully scraped: {len(scraped_jobs)} jobs")
-    print(f"   - Date folder: job-data/{date_folder}")
+    print(f"   - HTML and Markdown files saved in: job-data/{date_folder}")
+    print(f"   - HTML files: job-data/{date_folder}/html/")
+    print(f"   - Markdown files: job-data/{date_folder}/markdown/")
 
 
 if __name__ == "__main__":
