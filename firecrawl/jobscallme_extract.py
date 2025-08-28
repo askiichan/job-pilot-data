@@ -1,11 +1,15 @@
 import os
 import argparse
+import asyncio
+import aiofiles
 from google import genai
 from pydantic import BaseModel
 from typing import Optional
 import json
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 # Define the structured output model for a single job
 class JobData(BaseModel):
@@ -22,7 +26,7 @@ class JobsExtraction(BaseModel):
     jobs: list[JobData]
     total_jobs: int
 
-def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = True) -> JobsExtraction:
+async def extract_job_data_async(markdown_file_path: str, api_key: str, save_json: bool = True) -> JobsExtraction:
     """
     Extract structured job data from markdown file using Gemini API
     
@@ -34,9 +38,9 @@ def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = Tr
     Returns:
         JobsExtraction: Structured job data containing list of jobs
     """
-    # Read the markdown file
-    with open(markdown_file_path, 'r', encoding='utf-8') as file:
-        markdown_content = file.read()
+    # Read the markdown file asynchronously
+    async with aiofiles.open(markdown_file_path, 'r', encoding='utf-8') as file:
+        markdown_content = await file.read()
     
     # Initialize Gemini client
     client = genai.Client(api_key=api_key)
@@ -63,15 +67,20 @@ def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = Tr
     {markdown_content}
     """
     
-    # Generate structured response
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": JobsExtraction,
-        },
-    )
+    # Generate structured response (run in thread pool to avoid blocking)
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as executor:
+        response = await loop.run_in_executor(
+            executor,
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": JobsExtraction,
+                },
+            )
+        )
     
     # Parse the response
     jobs_data: JobsExtraction = response.parsed
@@ -86,13 +95,13 @@ def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = Tr
     
     # Save as JSON if requested
     if save_json:
-        save_job_data_as_json(jobs_data, markdown_file_path)
+        await save_job_data_as_json_async(jobs_data, markdown_file_path)
     
     return jobs_data
 
-def save_job_data_as_json(jobs_data: JobsExtraction, markdown_file_path: str) -> str:
+async def save_job_data_as_json_async(jobs_data: JobsExtraction, markdown_file_path: str) -> str:
     """
-    Save job data as JSON file in the specified directory structure
+    Save job data as JSON file in the specified directory structure (async)
     
     Args:
         jobs_data: The extracted jobs data
@@ -115,20 +124,34 @@ def save_job_data_as_json(jobs_data: JobsExtraction, markdown_file_path: str) ->
     json_filename = f"{md_filename}.json"
     output_path = output_dir / json_filename
     
-    # Save the JSON data
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(jobs_data.model_dump(), f, indent=2, ensure_ascii=False)
+    # Save the JSON data asynchronously
+    async with aiofiles.open(output_path, 'w', encoding='utf-8') as f:
+        await f.write(json.dumps(jobs_data.model_dump(), indent=2, ensure_ascii=False))
     
     print(f"✅ JSON saved to: {output_path}")
     return str(output_path)
 
-def process_multiple_files(markdown_dir: str, api_key: str) -> list[str]:
+def save_job_data_as_json(jobs_data: JobsExtraction, markdown_file_path: str) -> str:
     """
-    Process multiple markdown files from a directory
+    Synchronous wrapper for save_job_data_as_json_async
+    """
+    return asyncio.run(save_job_data_as_json_async(jobs_data, markdown_file_path))
+
+# Synchronous wrapper for extract_job_data_async  
+def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = True) -> JobsExtraction:
+    """
+    Synchronous wrapper for extract_job_data_async
+    """
+    return asyncio.run(extract_job_data_async(markdown_file_path, api_key, save_json))
+
+async def process_multiple_files_async(markdown_dir: str, api_key: str, max_concurrent: int = 5) -> list[str]:
+    """
+    Process multiple markdown files from a directory in parallel
     
     Args:
         markdown_dir: Directory containing markdown files
         api_key: Gemini API key
+        max_concurrent: Maximum number of concurrent API calls (default: 5)
         
     Returns:
         list[str]: List of JSON file paths that were created
@@ -144,23 +167,68 @@ def process_multiple_files(markdown_dir: str, api_key: str) -> list[str]:
         print(f"⚠️  No markdown files found in {markdown_dir}")
         return json_files
     
-    print(f"🔄 Processing {len(md_files)} markdown files...")
+    print(f"🚀 Processing {len(md_files)} markdown files in parallel (max {max_concurrent} concurrent)...")
+    start_time = time.time()
     
-    for md_file in md_files:
-        try:
-            print(f"\n📄 Processing: {md_file.name}")
-            job_data = extract_job_data(str(md_file), api_key)
-            
-            # The JSON file path is built in save_job_data_as_json
-            today = datetime.now().strftime("%Y%m%d")
-            json_path = f"job-data/{today}/json/{md_file.stem}.json"
-            json_files.append(json_path)
-            
-        except Exception as e:
-            print(f"❌ Error processing {md_file.name}: {e}")
+    # Create semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(max_concurrent)
     
-    print(f"\n🎉 Successfully processed {len(json_files)} files!")
-    return json_files
+    async def process_single_file(md_file: Path) -> tuple[str, bool, str]:
+        """Process a single file with semaphore limiting"""
+        async with semaphore:
+            try:
+                print(f"📄 Starting: {md_file.name}")
+                jobs_data = await extract_job_data_async(str(md_file), api_key)
+                
+                # The JSON file path is built in save_job_data_as_json
+                today = datetime.now().strftime("%Y%m%d")
+                json_path = f"firecrawl/job-data/{today}/json/{md_file.stem}.json"
+                
+                print(f"✅ Completed: {md_file.name} - Found {jobs_data.total_jobs} job(s)")
+                return json_path, True, ""
+                
+            except Exception as e:
+                print(f"❌ Failed: {md_file.name} - {e}")
+                return "", False, str(e)
+    
+    # Process all files concurrently
+    tasks = [process_single_file(md_file) for md_file in md_files]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Collect results
+    successful_files = []
+    failed_files = []
+    
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            failed_files.append((md_files[i].name, str(result)))
+        else:
+            json_path, success, error = result
+            if success:
+                successful_files.append(json_path)
+            else:
+                failed_files.append((md_files[i].name, error))
+    
+    # Summary
+    end_time = time.time()
+    processing_time = end_time - start_time
+    
+    print(f"\n🎉 Parallel processing completed in {processing_time:.2f} seconds!")
+    print(f"✅ Successfully processed: {len(successful_files)} files")
+    print(f"❌ Failed: {len(failed_files)} files")
+    
+    if failed_files:
+        print("\n❌ Failed files:")
+        for filename, error in failed_files:
+            print(f"   - {filename}: {error}")
+    
+    return successful_files
+
+def process_multiple_files(markdown_dir: str, api_key: str) -> list[str]:
+    """
+    Synchronous wrapper for process_multiple_files_async
+    """
+    return asyncio.run(process_multiple_files_async(markdown_dir, api_key))
 
 def process_batch_files(date_str: str = None, api_key: str = None) -> None:
     """
@@ -204,40 +272,16 @@ def process_batch_files(date_str: str = None, api_key: str = None) -> None:
         print(f"❌ No markdown files found in: {markdown_dir}")
         return
     
-    print("🚀 Starting batch job data extraction...")
-    print(f"📁 Processing directory: {markdown_dir}")
-    print(f"📄 Found {len(md_files)} markdown files")
-    print("-" * 60)
-    
-    # Process all files
-    successful_extractions = 0
-    failed_extractions = 0
-    
-    for i, md_file in enumerate(md_files, 1):
-        print(f"\n[{i}/{len(md_files)}] 📄 Processing: {md_file.name}")
-        
-        try:
-            # Extract job data (this will automatically save JSON file)
-            jobs_data = extract_job_data(str(md_file), api_key)
-            
-            print(f"   ✅ Success: Found {jobs_data.total_jobs} job(s)")
-            if jobs_data.jobs:
-                for j, job in enumerate(jobs_data.jobs, 1):
-                    print(f"      {j}. {job.job_title} @ {job.company_name}")
-            successful_extractions += 1
-            
-        except Exception as e:
-            print(f"   ❌ Error: {e}")
-            failed_extractions += 1
+    # Process all files in parallel  
+    successful_files = asyncio.run(process_multiple_files_async(markdown_dir, api_key, max_concurrent=5))
     
     # Summary
     print("\n" + "=" * 60)
-    print("🎉 BATCH PROCESSING COMPLETE")
-    print(f"✅ Successful extractions: {successful_extractions}")
-    print(f"❌ Failed extractions: {failed_extractions}")
+    print("🎉 PARALLEL BATCH PROCESSING COMPLETE")
+    print(f"✅ Successfully processed: {len(successful_files)} files")
     print(f"💾 JSON files saved to: firecrawl/job-data/{date_str}/json/")
     
-    if successful_extractions > 0:
+    if successful_files:
         print(f"\n📊 Check the JSON files in: firecrawl/job-data/{date_str}/json/")
 
 def process_single_file(file_path: str, api_key: str = None) -> None:
@@ -280,17 +324,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples (run from project root directory):
-  # Process all markdown files from today's directory
+  # Process all markdown files from today's directory (parallel processing)
   python firecrawl/jobscallme_extract.py
 
-  # Process all markdown files from a specific date
-  python firecrawl/jobscallme_extract.py --date 20250828
+  # Process all markdown files from a specific date with custom concurrency
+  python firecrawl/jobscallme_extract.py --date 20250828 --max-concurrent 10
 
   # Process a single file
   python firecrawl/jobscallme_extract.py --file firecrawl/job-data/20250828/markdown/bigfour-admin.md
 
-  # Process with custom API key
-  python firecrawl/jobscallme_extract.py --api-key YOUR_API_KEY
+  # Process with custom API key and reduced concurrency for rate limiting
+  python firecrawl/jobscallme_extract.py --api-key YOUR_API_KEY --max-concurrent 3
         """
     )
     
@@ -310,6 +354,13 @@ Examples (run from project root directory):
         '--api-key', '-k',
         type=str,
         help='Gemini API key (default: from GEMINI_API_KEY env var)'
+    )
+    
+    parser.add_argument(
+        '--max-concurrent', '-c',
+        type=int,
+        default=5,
+        help='Maximum number of concurrent API calls (default: 5)'
     )
     
     args = parser.parse_args()
