@@ -5,3 +5,4 @@ python-dateutil>=2.8.0
 firecrawl-py
 beautifulsoup4
 html2text
+boto3>=1.26.0
