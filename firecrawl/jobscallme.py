@@ -2,6 +2,7 @@ import json
 import os
 from typing import Dict, List, Optional
 from firecrawl import Firecrawl
+from bs4 import BeautifulSoup
 
 
 class JobscallMeCrawler:
@@ -40,9 +41,25 @@ class JobscallMeCrawler:
     def filter_job_links(self, all_links: List[str]) -> List[str]:
         filtered_links = []
         
+        # URLs to specifically exclude
+        excluded_urls = [
+            '/job/jobscallmefb'  # Exclude the jobscallmefb URL
+        ]
+        
         for link in all_links:
             if '/job/' in link:
                 job_part = link.split('/job/')[-1]
+                
+                # Check if this is a URL we want to exclude
+                should_exclude = False
+                for excluded_url in excluded_urls:
+                    if excluded_url in link:
+                        should_exclude = True
+                        print(f"🚫 Excluding specific URL: {link}")
+                        break
+                
+                if should_exclude:
+                    continue
                 
                 if (job_part and 
                     '/' not in job_part and 
@@ -101,18 +118,21 @@ class JobscallMeCrawler:
             
             # Get HTML content from the result
             if scrape_result:
+                # Extract the full HTML content first
+                html_content = None
+                
                 # Check if it's a dictionary with html key
                 if isinstance(scrape_result, dict) and 'html' in scrape_result:
                     print(f"✅ Found html key in dict")
-                    return scrape_result['html']
+                    html_content = scrape_result['html']
                 # Check if it has html attribute
                 elif hasattr(scrape_result, 'html') and scrape_result.html:
                     print(f"✅ Found html attribute with content")
-                    return scrape_result.html
+                    html_content = scrape_result.html
                 # Check for raw_html attribute
                 elif hasattr(scrape_result, 'raw_html') and scrape_result.raw_html:
                     print(f"✅ Found raw_html attribute with content")
-                    return scrape_result.raw_html
+                    html_content = scrape_result.raw_html
                 else:
                     print(f"⚠️ No HTML content found")
                     print(f"🔍 Result structure: {type(scrape_result)}")
@@ -121,6 +141,45 @@ class JobscallMeCrawler:
                     else:
                         print(f"🔍 Available attributes: {dir(scrape_result)}")
                     return None
+                
+                # Extract only the content within <article> tags and get time value
+                if html_content:
+                    try:
+                        soup = BeautifulSoup(html_content, 'html.parser')
+                        article = soup.find('article')
+                        
+                        # Create a result object with metadata
+                        result = {
+                            'html_content': None,
+                            'article_found': False,
+                            'time_value': None
+                        }
+                        
+                        if article:
+                            print(f"✅ Found <article> tag, extracting content")
+                            # Store the article content
+                            result['html_content'] = str(article)
+                            result['article_found'] = True
+                            
+                            # Try to extract time value from within the article
+                            time_tag = article.find('time')
+                            if time_tag:
+                                # Get the datetime attribute if available, otherwise use the text content
+                                time_value = time_tag.get('datetime', time_tag.text.strip())
+                                result['time_value'] = time_value
+                                print(f"✅ Found <time> tag: {time_value}")
+                            else:
+                                print(f"⚠️ No <time> tag found within article")
+                        else:
+                            print(f"⚠️ No <article> tag found, returning full HTML")
+                            result['html_content'] = html_content
+                        
+                        return result
+                    except Exception as e:
+                        print(f"❌ Error parsing HTML: {str(e)}")
+                        return {'html_content': html_content, 'article_found': False, 'time_value': None}
+                
+                return html_content
             else:
                 print(f"⚠️ No content found for: {url}")
                 return None
@@ -148,8 +207,8 @@ class JobscallMeCrawler:
         for i, job_url in enumerate(jobs_to_scrape, 1):
             print(f"\n[{i}/{len(jobs_to_scrape)}] Processing: {job_url}")
             
-            html_content = self.scrape_job_page(job_url)
-            if html_content:
+            result = self.scrape_job_page(job_url)
+            if result and isinstance(result, dict) and result.get('html_content'):
                 # Extract filename from URL path
                 url_path = job_url.split('/job/')[-1] if '/job/' in job_url else f"job_{i}"
                 filename = f"{url_path}.html"
@@ -164,14 +223,23 @@ class JobscallMeCrawler:
                 
                 output_file = os.path.join(job_data_dir, filename)
                 
+                html_content = result['html_content']
                 with open(output_file, 'w', encoding='utf-8') as f:
                     f.write(html_content)
                 
-                scraped_jobs.append({
+                # Create job info with metadata
+                job_info = {
                     "url": job_url,
                     "filename": filename,
-                    "content_length": len(html_content)
-                })
+                    "content_length": len(html_content),
+                    "article_found": result.get('article_found', False)
+                }
+                
+                # Add time value if available
+                if result.get('time_value'):
+                    job_info["time_value"] = result['time_value']
+                
+                scraped_jobs.append(job_info)
                 
                 print(f"✅ Saved: {filename}")
             else:
