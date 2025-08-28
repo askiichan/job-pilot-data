@@ -1,3 +1,7 @@
 google-genai>=0.8.0
 pydantic>=2.0.0
 aiofiles>=23.0.0
+python-dateutil>=2.8.0
+firecrawl-py
+beautifulsoup4
+html2text

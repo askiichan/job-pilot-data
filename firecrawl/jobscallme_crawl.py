@@ -5,19 +5,31 @@ from typing import Dict, List, Optional
 from firecrawl import Firecrawl
 from bs4 import BeautifulSoup
 import html2text
+from dateutil import parser
+from dateutil.relativedelta import relativedelta
 
 
 class JobscallMeCrawler:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.firecrawl = Firecrawl(api_key=api_key)
+    def __init__(self, base_url: str = None):
+        # Set default localhost URL if not provided
+        if not base_url:
+            base_url = "http://localhost:3002"  # Default local Firecrawl port
+        
+        # Initialize Firecrawl with localhost URL and dummy API key
+        # For localhost, the API key is not validated but still required by the SDK
+        self.firecrawl = Firecrawl(api_key="localhost", api_url=base_url)
     
     def map_website(self, url: str) -> Optional[Dict]:
         try:
             print(f"🔍 Mapping website: {url}")
-            map_result = self.firecrawl.map(url=url, limit=20)
+            map_result = self.firecrawl.map(url=url)
             print(f"✅ Successfully mapped website")
             return map_result
+        except ConnectionError as e:
+            print(f"❌ Connection failed: {str(e)}")
+            print("ℹ️  Make sure your local Firecrawl instance is running")
+            print("ℹ️  Check if the base URL is correct")
+            return None
         except Exception as e:
             print(f"❌ Request failed: {str(e)}")
             return None
@@ -71,6 +83,41 @@ class JobscallMeCrawler:
                     filtered_links.append(link)
         
         return filtered_links
+    
+    def is_job_too_old(self, time_value: str) -> bool:
+        """
+        Check if a job posting is over 1 month old
+        
+        Args:
+            time_value (str): Time value from the job posting
+            
+        Returns:
+            bool: True if job is over 1 month old, False otherwise
+        """
+        try:
+            # Parse the time value
+            job_date = parser.parse(time_value)
+            
+            # Get current date
+            current_date = datetime.datetime.now()
+            
+            # Calculate 1 month ago
+            one_month_ago = current_date - relativedelta(months=1)
+            
+            # Check if job date is older than 1 month
+            is_old = job_date < one_month_ago
+            
+            if is_old:
+                print(f"📅 Job date {job_date.strftime('%Y-%m-%d')} is older than {one_month_ago.strftime('%Y-%m-%d')}")
+            else:
+                print(f"📅 Job date {job_date.strftime('%Y-%m-%d')} is within the last month")
+            
+            return is_old
+            
+        except Exception as e:
+            print(f"⚠️ Could not parse date '{time_value}': {e}")
+            # If we can't parse the date, assume it's not too old and continue
+            return False
     
     def crawl_jobscall_me(self) -> Optional[List[str]]:
         target_url = "https://www.jobscall.me/job"
@@ -170,8 +217,16 @@ class JobscallMeCrawler:
                                 time_value = time_tag.get('datetime', time_tag.text.strip())
                                 result['time_value'] = time_value
                                 print(f"✅ Found <time> tag: {time_value}")
+                                
+                                # Check if the job posting is over 1 month old
+                                if self.is_job_too_old(time_value):
+                                    print(f"🛑 Job posting is over 1 month old - stopping crawl")
+                                    result['stop_crawling'] = True
+                                else:
+                                    result['stop_crawling'] = False
                             else:
                                 print(f"⚠️ No <time> tag found within article")
+                                result['stop_crawling'] = False
                         else:
                             print(f"⚠️ No <article> tag found, returning full HTML")
                             result['html_content'] = html_content
@@ -186,6 +241,10 @@ class JobscallMeCrawler:
                 print(f"⚠️ No content found for: {url}")
                 return None
                 
+        except ConnectionError as e:
+            print(f"❌ Connection failed for {url}: {str(e)}")
+            print("ℹ️  Make sure your local Firecrawl instance is running")
+            return None
         except Exception as e:
             print(f"❌ Failed to scrape {url}: {str(e)}")
             return None
@@ -250,6 +309,11 @@ class JobscallMeCrawler:
             
             result = self.scrape_job_page(job_url)
             if result and isinstance(result, dict) and result.get('html_content'):
+                # Check if we should stop crawling due to old job
+                if result.get('stop_crawling', False):
+                    print(f"🛑 Stopping crawl - encountered job older than 1 month")
+                    break
+                
                 # Extract filename from URL path
                 url_path = job_url.split('/job/')[-1] if '/job/' in job_url else f"job_{i}"
                 html_filename = f"{url_path}.html"
@@ -345,26 +409,23 @@ class JobscallMeCrawler:
             print(f"📁 Markdown files saved in: {os.path.join(date_dir, 'jobscallme', 'markdown')}")
 
 
-def get_api_key() -> Optional[str]:
-    api_key = os.getenv('FIRECRAWL_API_KEY')
+def get_base_url() -> str:
+    base_url = os.getenv('FIRECRAWL_BASE_URL', 'http://localhost:3002')
     
-    if not api_key:
-        print("⚠️  FIRECRAWL_API_KEY environment variable not found")
-        api_key = input("Please enter your Firecrawl API key: ").strip()
-        
-        if not api_key:
-            print("❌ API key is required. Exiting...")
-            return None
+    if base_url == 'http://localhost:3002':
+        print(f"ℹ️  Using default localhost URL: {base_url}")
+        print("ℹ️  Set FIRECRAWL_BASE_URL environment variable to override")
+    else:
+        print(f"ℹ️  Using custom Firecrawl URL: {base_url}")
     
-    return api_key
+    return base_url
 
 
 def main():
-    api_key = get_api_key()
-    if not api_key:
-        return
+    base_url = get_base_url()
     
-    crawler = JobscallMeCrawler(api_key)
+    # Initialize crawler with localhost URL (no API key needed)
+    crawler = JobscallMeCrawler(base_url)
     
     # Step 1: Map and discover job links
     print("🚀 Step 1: Mapping website to discover job links...")
