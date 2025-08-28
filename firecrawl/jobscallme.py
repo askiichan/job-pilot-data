@@ -1,5 +1,6 @@
 import json
 import os
+import datetime
 from typing import Dict, List, Optional
 from firecrawl import Firecrawl
 from bs4 import BeautifulSoup
@@ -13,7 +14,7 @@ class JobscallMeCrawler:
     def map_website(self, url: str) -> Optional[Dict]:
         try:
             print(f"🔍 Mapping website: {url}")
-            map_result = self.firecrawl.map(url=url, limit=5)
+            map_result = self.firecrawl.map(url=url, limit=20)
             print(f"✅ Successfully mapped website")
             return map_result
         except Exception as e:
@@ -188,13 +189,13 @@ class JobscallMeCrawler:
             print(f"❌ Failed to scrape {url}: {str(e)}")
             return None
     
-    def scrape_all_jobs(self, job_links: List[str], max_jobs: int = 10) -> List[Dict]:
+    def scrape_all_jobs(self, job_links: List[str], max_jobs: int = 500) -> List[Dict]:
         """
         Scrape all discovered job pages and save as HTML files
         
         Args:
             job_links (List[str]): List of job URLs to scrape
-            max_jobs (int): Maximum number of jobs to scrape (default: 10)
+            max_jobs (int): Maximum number of jobs to scrape (default: 500)
             
         Returns:
             List[Dict]: List of scraped job information
@@ -203,6 +204,19 @@ class JobscallMeCrawler:
         jobs_to_scrape = job_links[:max_jobs]
         
         print(f"\n🔍 Starting to scrape {len(jobs_to_scrape)} job pages...")
+        
+        # Get current date for folder structure
+        today = datetime.datetime.now()
+        date_folder = today.strftime("%Y%m%d")
+        
+        # Create directory structure
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        date_dir = os.path.join(script_dir, "job-data", date_folder)
+        html_dir = os.path.join(date_dir, "html")
+        
+        # Create directories if they don't exist
+        os.makedirs(date_dir, exist_ok=True)
+        os.makedirs(html_dir, exist_ok=True)
         
         for i, job_url in enumerate(jobs_to_scrape, 1):
             print(f"\n[{i}/{len(jobs_to_scrape)}] Processing: {job_url}")
@@ -213,15 +227,8 @@ class JobscallMeCrawler:
                 url_path = job_url.split('/job/')[-1] if '/job/' in job_url else f"job_{i}"
                 filename = f"{url_path}.html"
                 
-                # Create job-data folder and save HTML content
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                job_data_dir = os.path.join(script_dir, "job-data")
-                
-                # Create job-data directory if it doesn't exist
-                if not os.path.exists(job_data_dir):
-                    os.makedirs(job_data_dir)
-                
-                output_file = os.path.join(job_data_dir, filename)
+                # Save HTML content to date-based directory
+                output_file = os.path.join(html_dir, filename)
                 
                 html_content = result['html_content']
                 with open(output_file, 'w', encoding='utf-8') as f:
@@ -248,17 +255,37 @@ class JobscallMeCrawler:
         print(f"\n📊 Scraping Summary:")
         print(f"   Successfully scraped: {len(scraped_jobs)}/{len(jobs_to_scrape)} jobs")
         
-        return scraped_jobs
+        return scraped_jobs, date_folder
     
-    def save_results(self, links: List[str], scraped_jobs: List[Dict] = None):
+    def save_results(self, links: List[str], scraped_jobs: List[Dict] = None, date_folder: str = None):
+        """
+        Save results to date-based directory structure
+        
+        Args:
+            links (List[str]): List of discovered links
+            scraped_jobs (List[Dict]): List of scraped job information
+            date_folder (str): Date folder name (format: YYYYMMDD)
+        """
         script_dir = os.path.dirname(os.path.abspath(__file__))
         
+        # If date_folder is not provided, use today's date
+        if not date_folder:
+            today = datetime.datetime.now()
+            date_folder = today.strftime("%Y%m%d")
+        
+        # Create date directory if it doesn't exist
+        date_dir = os.path.join(script_dir, "job-data", date_folder)
+        os.makedirs(date_dir, exist_ok=True)
+        
+        # Format current timestamp
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         # Save discovered links
-        links_file = os.path.join(script_dir, "jobscall_me_links.json")
+        links_file = os.path.join(date_dir, "jobscall_me_links.json")
         with open(links_file, 'w', encoding='utf-8') as f:
             json.dump({
                 "url": "https://www.jobscall.me/job",
-                "timestamp": "2024-01-01",
+                "timestamp": timestamp,
                 "total_links": len(links),
                 "links": links
             }, f, indent=2, ensure_ascii=False)
@@ -267,17 +294,17 @@ class JobscallMeCrawler:
         
         # Save scraping summary if available
         if scraped_jobs:
-            summary_file = os.path.join(script_dir, "scraping_summary.json")
+            summary_file = os.path.join(date_dir, "scraping_summary.json")
             with open(summary_file, 'w', encoding='utf-8') as f:
                 json.dump({
                     "source": "jobscall.me",
-                    "timestamp": "2024-01-01",
+                    "timestamp": timestamp,
                     "total_jobs": len(scraped_jobs),
                     "scraped_jobs": scraped_jobs
                 }, f, indent=2, ensure_ascii=False)
             
             print(f"💾 Scraping summary saved to: {summary_file}")
-            print(f"📁 HTML files saved in: {os.path.join(script_dir, 'job-data')}")
+            print(f"📁 HTML files saved in: {os.path.join(date_dir, 'html')}")
 
 
 def get_api_key() -> Optional[str]:
@@ -313,16 +340,17 @@ def main():
     
     # Step 2: Scrape individual job pages
     print("\n🚀 Step 2: Scraping individual job pages...")
-    scraped_jobs = crawler.scrape_all_jobs(links, max_jobs=10)
+    scraped_jobs, date_folder = crawler.scrape_all_jobs(links, max_jobs=500)
     
     # Step 3: Save results
     print("\n🚀 Step 3: Saving results...")
-    crawler.save_results(links, scraped_jobs)
+    crawler.save_results(links, scraped_jobs, date_folder)
     
     print(f"\n✅ Crawling completed successfully!")
     print(f"📊 Summary:")
     print(f"   - Discovered links: {len(links)}")
     print(f"   - Successfully scraped: {len(scraped_jobs)} jobs")
+    print(f"   - Date folder: job-data/{date_folder}")
 
 
 if __name__ == "__main__":
