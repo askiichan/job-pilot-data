@@ -14,6 +14,8 @@ class JobData(BaseModel):
     post_date: str
     job_description: Optional[str]
     job_requirement: Optional[str]
+    job_url: str
+    source: str
 
 # Define the structured output model for multiple jobs
 class JobsExtraction(BaseModel):
@@ -49,9 +51,13 @@ def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = Tr
     - post_date: The posting date in YYYY-MM-DD format
     - job_description: The job description section (if available)
     - job_requirement: All requirements listed for the job (preserve formatting with bullet points)
+    - job_url: Leave empty (will be populated automatically)
+    - source: Leave empty (will be populated automatically)
     
     Return a list of all jobs found in the document. If there's only one job, return a list with one item.
     Set total_jobs to the number of jobs found.
+    
+    Note: The job_url and source fields will be automatically populated after extraction.
     
     Markdown content:
     {markdown_content}
@@ -69,6 +75,14 @@ def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = Tr
     
     # Parse the response
     jobs_data: JobsExtraction = response.parsed
+    
+    # Get the markdown filename for URL generation
+    md_filename = Path(markdown_file_path).stem
+    
+    # Update each job with the URL and source
+    for job in jobs_data.jobs:
+        job.job_url = f"https://www.jobscall.me/job/{md_filename}"
+        job.source = "jobscallme"
     
     # Save as JSON if requested
     if save_json:
