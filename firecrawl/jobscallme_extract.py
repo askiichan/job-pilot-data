@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-# Define the structured output model
+# Define the structured output model for a single job
 class JobData(BaseModel):
     job_title: str
     company_name: str
@@ -15,17 +15,22 @@ class JobData(BaseModel):
     job_description: Optional[str]
     job_requirement: Optional[str]
 
-def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = True) -> JobData:
+# Define the structured output model for multiple jobs
+class JobsExtraction(BaseModel):
+    jobs: list[JobData]
+    total_jobs: int
+
+def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = True) -> JobsExtraction:
     """
     Extract structured job data from markdown file using Gemini API
     
     Args:
-        markdown_file_path: Path to the markdown file containing job posting
+        markdown_file_path: Path to the markdown file containing job posting(s)
         api_key: Gemini API key
         save_json: Whether to save the extracted data as JSON file (default: True)
         
     Returns:
-        JobData: Structured job data
+        JobsExtraction: Structured job data containing list of jobs
     """
     # Read the markdown file
     with open(markdown_file_path, 'r', encoding='utf-8') as file:
@@ -36,14 +41,17 @@ def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = Tr
     
     # Create the prompt for extraction
     prompt = f"""
-    Extract job information from the following markdown content and structure it according to the specified format.
+    Extract job information from the following markdown content. The content may contain multiple job postings.
     
-    Please extract:
+    For each job found, extract:
     - job_title: The main job title (include both English and Chinese if available)
     - company_name: The company name
     - post_date: The posting date in YYYY-MM-DD format
     - job_description: The job description section (if available)
     - job_requirement: All requirements listed for the job (preserve formatting with bullet points)
+    
+    Return a list of all jobs found in the document. If there's only one job, return a list with one item.
+    Set total_jobs to the number of jobs found.
     
     Markdown content:
     {markdown_content}
@@ -55,25 +63,25 @@ def extract_job_data(markdown_file_path: str, api_key: str, save_json: bool = Tr
         contents=prompt,
         config={
             "response_mime_type": "application/json",
-            "response_schema": JobData,
+            "response_schema": JobsExtraction,
         },
     )
     
     # Parse the response
-    job_data: JobData = response.parsed
+    jobs_data: JobsExtraction = response.parsed
     
     # Save as JSON if requested
     if save_json:
-        save_job_data_as_json(job_data, markdown_file_path)
+        save_job_data_as_json(jobs_data, markdown_file_path)
     
-    return job_data
+    return jobs_data
 
-def save_job_data_as_json(job_data: JobData, markdown_file_path: str) -> str:
+def save_job_data_as_json(jobs_data: JobsExtraction, markdown_file_path: str) -> str:
     """
     Save job data as JSON file in the specified directory structure
     
     Args:
-        job_data: The extracted job data
+        jobs_data: The extracted jobs data
         markdown_file_path: Original markdown file path
         
     Returns:
@@ -95,7 +103,7 @@ def save_job_data_as_json(job_data: JobData, markdown_file_path: str) -> str:
     
     # Save the JSON data
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(job_data.model_dump(), f, indent=2, ensure_ascii=False)
+        json.dump(jobs_data.model_dump(), f, indent=2, ensure_ascii=False)
     
     print(f"✅ JSON saved to: {output_path}")
     return str(output_path)
@@ -196,10 +204,12 @@ def process_batch_files(date_str: str = None, api_key: str = None) -> None:
         
         try:
             # Extract job data (this will automatically save JSON file)
-            job_data = extract_job_data(str(md_file), api_key)
+            jobs_data = extract_job_data(str(md_file), api_key)
             
-            print(f"   ✅ Success: {job_data.job_title}")
-            print(f"   🏢 Company: {job_data.company_name}")
+            print(f"   ✅ Success: Found {jobs_data.total_jobs} job(s)")
+            if jobs_data.jobs:
+                for j, job in enumerate(jobs_data.jobs, 1):
+                    print(f"      {j}. {job.job_title} @ {job.company_name}")
             successful_extractions += 1
             
         except Exception as e:
@@ -239,12 +249,12 @@ def process_single_file(file_path: str, api_key: str = None) -> None:
     
     try:
         # Extract job data (this will also save the JSON file automatically)
-        job_data = extract_job_data(file_path, api_key)
+        jobs_data = extract_job_data(file_path, api_key)
         
         # Print the extracted data as JSON
-        print("\n📊 Extracted Job Data:")
+        print(f"\n📊 Extracted {jobs_data.total_jobs} Job(s):")
         print("-" * 50)
-        print(json.dumps(job_data.model_dump(), indent=2, ensure_ascii=False))
+        print(json.dumps(jobs_data.model_dump(), indent=2, ensure_ascii=False))
         
     except Exception as e:
         print(f"❌ Error extracting job data: {e}")
