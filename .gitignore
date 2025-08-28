@@ -3,3 +3,5 @@ job-data/
 *.log
 .DS_Store
 .env
+jobscall_me_links.json
+scraping_summary.json

@@ -1,0 +1,1 @@
+gemini -y -p "execute the task in @task.md"
