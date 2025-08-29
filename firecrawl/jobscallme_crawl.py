@@ -18,7 +18,6 @@ from dateutil.relativedelta import relativedelta
 class CrawlerConfig:
     """Configuration for the JobscallMe crawler."""
     base_url: str = "http://localhost:3002"
-    max_age_days: Optional[int] = None
     target_date: Optional[datetime.date] = None
     concurrency: int = 5
     max_jobs: int = 500
@@ -46,18 +45,13 @@ class DateUtils:
             return None
     
     @staticmethod
-    def is_job_too_old(time_value: str, max_age_days: Optional[int] = None) -> bool:
-        """Check if a job posting is older than the configured cutoff."""
+    def is_job_too_old(time_value: str) -> bool:
+        """Check if a job posting is older than 1 month."""
         try:
             job_date = parser.parse(time_value)
             current_date = datetime.datetime.now()
-            
-            if max_age_days is not None:
-                cutoff_date = current_date - datetime.timedelta(days=max_age_days)
-                cutoff_desc = f"last {max_age_days} days"
-            else:
-                cutoff_date = current_date - relativedelta(months=1)
-                cutoff_desc = "the last month"
+            cutoff_date = current_date - relativedelta(months=1)
+            cutoff_desc = "the last month"
             
             is_old = job_date < cutoff_date
             
@@ -245,7 +239,11 @@ class AsyncFirecrawlClient:
             async with self.session.post(scrape_url, json=payload) as response:
                 if response.status == 200:
                     result = await response.json()
-                    return result.get('data', {})
+                    # Debug: Print response structure
+                    print(f"🔍 API Response structure: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+                    
+                    # Return the full result for debugging, not just 'data'
+                    return result
                 else:
                     print(f"⚠️ HTTP {response.status} for {url}")
                     return None
@@ -351,9 +349,25 @@ class JobscallMeCrawler:
     
     def _extract_html_content(self, scrape_result) -> Optional[str]:
         """Extract HTML content from Firecrawl scrape result."""
+        # Debug: Print the structure to understand the response format
+        if isinstance(scrape_result, dict):
+            print(f"🔍 Response keys: {list(scrape_result.keys())}")
+        
+        # Try different possible locations for HTML content
         if isinstance(scrape_result, dict) and 'html' in scrape_result:
             print(f"✅ Found html key in dict")
             return scrape_result['html']
+        elif isinstance(scrape_result, dict) and 'content' in scrape_result:
+            print(f"✅ Found content key in dict")
+            return scrape_result['content']
+        elif isinstance(scrape_result, dict) and 'data' in scrape_result and isinstance(scrape_result['data'], dict):
+            data = scrape_result['data']
+            if 'html' in data:
+                print(f"✅ Found html in data object")
+                return data['html']
+            elif 'content' in data:
+                print(f"✅ Found content in data object")
+                return data['content']
         elif hasattr(scrape_result, 'html') and scrape_result.html:
             print(f"✅ Found html attribute with content")
             return scrape_result.html
@@ -362,6 +376,14 @@ class JobscallMeCrawler:
             return scrape_result.raw_html
         else:
             print(f"⚠️ No HTML content found")
+            if isinstance(scrape_result, dict):
+                print(f"🔍 Available keys: {list(scrape_result.keys())}")
+                # Print first few characters of each value to debug
+                for key, value in scrape_result.items():
+                    if isinstance(value, str) and len(value) > 50:
+                        print(f"🔍 {key}: {value[:100]}...")
+                    else:
+                        print(f"🔍 {key}: {value}")
             return None
     
     def _should_stop_crawling(self, time_value: str, job_date: datetime.date) -> Tuple[bool, bool]:
@@ -373,48 +395,18 @@ class JobscallMeCrawler:
             return False, matches  # Never stop early in target date mode
         else:
             # Check age cutoff
-            if DateUtils.is_job_too_old(time_value, self.config.max_age_days):
-                cutoff_desc = f"{self.config.max_age_days} days" if self.config.max_age_days else "1 month"
-                print(f"🛑 Job posting is older than cutoff ({cutoff_desc}) - stopping crawl")
+            if DateUtils.is_job_too_old(time_value):
+                print(f"🛑 Job posting is older than cutoff (1 month) - stopping crawl")
                 return True, False
             return False, True
     
-    async def scrape_job_page_async(self, client: AsyncFirecrawlClient, url: str) -> Optional[Dict]:
-        """Async scrape individual job page and extract content with metadata."""
+    async def scrape_job_page_async(self, executor, url: str) -> Optional[Dict]:
+        """Async wrapper around sync scraping - more reliable than direct HTTP."""
         try:
-            scrape_result = await client.scrape_async(url)
-            
-            if not scrape_result:
-                return None
-            
-            html_content = self._extract_html_content(scrape_result)
-            if not html_content:
-                return None
-            
-            # Process HTML content
-            processed_result = self.html_processor.extract_article_content(html_content)
-            
-            # Handle date logic if time value is found
-            if processed_result.get('time_value'):
-                try:
-                    parsed_dt = parser.parse(processed_result['time_value'])
-                    job_date = parsed_dt.date()
-                    processed_result['job_date'] = job_date.isoformat()
-                    
-                    stop_crawling, matches_criteria = self._should_stop_crawling(
-                        processed_result['time_value'], job_date
-                    )
-                    processed_result['stop_crawling'] = stop_crawling
-                    processed_result['matches_target_date'] = matches_criteria
-                except Exception:
-                    processed_result['stop_crawling'] = False
-                    processed_result['matches_target_date'] = self.config.target_date is None
-            else:
-                processed_result['stop_crawling'] = False
-                processed_result['matches_target_date'] = self.config.target_date is None
-            
-            return processed_result
-            
+            # Run the sync method in a thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, self.scrape_job_page, url)
+            return result
         except Exception as e:
             print(f"❌ Failed to scrape {url}: {str(e)}")
             return None
@@ -467,7 +459,7 @@ class JobscallMeCrawler:
     
     
     async def scrape_all_jobs_async(self, job_links: List[str]) -> Tuple[List[Dict], str]:
-        """Async version - significantly faster for scraping multiple jobs."""
+        """Async version using ThreadPoolExecutor - more reliable than direct HTTP."""
         scraped_jobs = []
         jobs_to_scrape = job_links[:self.config.max_jobs]
         
@@ -486,9 +478,9 @@ class JobscallMeCrawler:
         # Create semaphore to limit concurrent requests
         semaphore = asyncio.Semaphore(self.config.concurrency)
         
-        async def scrape_with_semaphore(client: AsyncFirecrawlClient, url: str, index: int):
+        async def scrape_with_semaphore(executor, url: str, index: int):
             async with semaphore:
-                result = await self.scrape_job_page_async(client, url)
+                result = await self.scrape_job_page_async(executor, url)
                 if result:
                     print(f"\n[{index+1}/{total}] ✅ Completed: {url}")
                 else:
@@ -525,11 +517,11 @@ class JobscallMeCrawler:
             scraped_jobs.append(job_info)
             print(f"✅ Saved: {file_info['html_filename']} / {file_info['md_filename']}")
         
-        # Use async context manager for HTTP client
-        async with AsyncFirecrawlClient(self.config.base_url) as client:
+        # Use ThreadPoolExecutor for reliable sync method execution
+        with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
             # Create all tasks
             tasks = [
-                scrape_with_semaphore(client, url, idx) 
+                scrape_with_semaphore(executor, url, idx) 
                 for idx, url in enumerate(jobs_to_scrape)
             ]
             
@@ -545,8 +537,7 @@ class JobscallMeCrawler:
                     if result and isinstance(result, dict) and result.get('html_content'):
                         # Early stop only when not in target-date mode
                         if result.get('stop_crawling', False) and self.config.target_date is None:
-                            cutoff_desc = f"{self.config.max_age_days} days" if self.config.max_age_days else "1 month"
-                            print(f"🛑 Stopping crawl - encountered job older than {cutoff_desc}")
+                            print(f"🛑 Stopping crawl - encountered job older than 1 month")
                             should_stop = True
                             # Cancel remaining tasks
                             for task in tasks:
@@ -633,8 +624,7 @@ class JobscallMeCrawler:
                 if result and isinstance(result, dict) and result.get('html_content'):
                     # Early stop only when not in target-date mode
                     if result.get('stop_crawling', False) and self.config.target_date is None:
-                        cutoff_desc = f"{self.config.max_age_days} days" if self.config.max_age_days else "1 month"
-                        print(f"🛑 Stopping crawl - encountered job older than {cutoff_desc}")
+                        print(f"🛑 Stopping crawl - encountered job older than 1 month")
                         # Cancel remaining futures
                         for f in future_to_url:
                             if not f.done():
@@ -674,16 +664,10 @@ def main():
     """Main function to run the JobscallMe crawler."""
     parser_obj = argparse.ArgumentParser(description="Crawl jobscall.me and scrape jobs")
     parser_obj.add_argument(
-        "--max-age-days",
-        type=int,
-        default=None,
-        help="Cutoff in days for job recency (e.g., 14). If not set, defaults to 1-month cutoff."
-    )
-    parser_obj.add_argument(
         "--target-date",
         type=str,
         default=None,
-        help="Only crawl jobs posted on this specific date (YYYY-MM-DD). When provided, overrides --max-age-days and does not stop early."
+        help="Only crawl jobs posted on this specific date (YYYY-MM-DD). When provided, does not stop early."
     )
     parser_obj.add_argument(
         "--concurrency",
@@ -698,7 +682,6 @@ def main():
     # Create configuration
     config = CrawlerConfig(
         base_url=base_url,
-        max_age_days=args.max_age_days,
         target_date=DateUtils.parse_target_date(args.target_date),
         concurrency=args.concurrency
     )
@@ -709,8 +692,6 @@ def main():
     # Display configuration
     if config.target_date is not None:
         print(f"ℹ️  Target date mode: only jobs from {config.target_date.isoformat()} will be saved")
-    elif config.max_age_days is not None:
-        print(f"ℹ️  Using cutoff: last {config.max_age_days} days (--max-age-days)")
     else:
         print("ℹ️  Using default cutoff: last 1 month")
     print(f"ℹ️  Concurrency: {config.concurrency} workers")
