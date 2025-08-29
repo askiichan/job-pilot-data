@@ -2,7 +2,11 @@ import json
 import os
 import datetime
 import argparse
-from typing import Dict, List, Optional
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 from firecrawl import Firecrawl
 from bs4 import BeautifulSoup
 import html2text
@@ -10,32 +14,258 @@ from dateutil import parser
 from dateutil.relativedelta import relativedelta
 
 
+@dataclass
+class CrawlerConfig:
+    """Configuration for the JobscallMe crawler."""
+    base_url: str = "http://localhost:3002"
+    max_age_days: Optional[int] = None
+    target_date: Optional[datetime.date] = None
+    concurrency: int = 5
+    max_jobs: int = 500
+    target_site_url: str = "https://www.jobscall.me/job"
+    excluded_urls: List[str] = None
+    
+    def __post_init__(self):
+        if self.excluded_urls is None:
+            self.excluded_urls = ['/job/jobscallmefb']
+        self.concurrency = max(1, self.concurrency)
+
+
+class DateUtils:
+    """Utility functions for date operations."""
+    
+    @staticmethod
+    def parse_target_date(target_date_str: str) -> Optional[datetime.date]:
+        """Parse target date string into date object."""
+        if not target_date_str:
+            return None
+        try:
+            return datetime.date.fromisoformat(target_date_str)
+        except ValueError:
+            print(f"⚠️  Invalid --target-date '{target_date_str}'. Expected format YYYY-MM-DD. Ignoring it.")
+            return None
+    
+    @staticmethod
+    def is_job_too_old(time_value: str, max_age_days: Optional[int] = None) -> bool:
+        """Check if a job posting is older than the configured cutoff."""
+        try:
+            job_date = parser.parse(time_value)
+            current_date = datetime.datetime.now()
+            
+            if max_age_days is not None:
+                cutoff_date = current_date - datetime.timedelta(days=max_age_days)
+                cutoff_desc = f"last {max_age_days} days"
+            else:
+                cutoff_date = current_date - relativedelta(months=1)
+                cutoff_desc = "the last month"
+            
+            is_old = job_date < cutoff_date
+            
+            if is_old:
+                print(f"📅 Job date {job_date.strftime('%Y-%m-%d')} is older than cutoff {cutoff_date.strftime('%Y-%m-%d')} ({cutoff_desc})")
+            else:
+                print(f"📅 Job date {job_date.strftime('%Y-%m-%d')} is within {cutoff_desc}")
+            
+            return is_old
+            
+        except Exception as e:
+            print(f"⚠️ Could not parse date '{time_value}': {e}")
+            return False
+
+
+class HtmlProcessor:
+    """Handles HTML content processing and conversion."""
+    
+    def __init__(self):
+        self.html2text_converter = self._setup_html2text()
+    
+    def _setup_html2text(self) -> html2text.HTML2Text:
+        """Configure html2text converter."""
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.ignore_tables = False
+        h.body_width = 0
+        return h
+    
+    def extract_article_content(self, html_content: str) -> Dict:
+        """Extract article content and metadata from HTML."""
+        result = {
+            'html_content': None,
+            'article_found': False,
+            'time_value': None,
+            'job_date': None
+        }
+        
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            article = soup.find('article')
+            
+            if article:
+                print(f"✅ Found <article> tag, extracting content")
+                result['html_content'] = str(article)
+                result['article_found'] = True
+                
+                # Extract time information
+                time_tag = article.find('time')
+                if time_tag:
+                    time_value = time_tag.get('datetime', time_tag.text.strip())
+                    result['time_value'] = time_value
+                    print(f"✅ Found <time> tag: {time_value}")
+                    
+                    try:
+                        parsed_dt = parser.parse(time_value)
+                        result['job_date'] = parsed_dt.date().isoformat()
+                    except Exception:
+                        pass
+                else:
+                    print(f"⚠️ No <time> tag found within article")
+            else:
+                print(f"⚠️ No <article> tag found, returning full HTML")
+                result['html_content'] = html_content
+            
+            return result
+        except Exception as e:
+            print(f"❌ Error parsing HTML: {str(e)}")
+            return {'html_content': html_content, 'article_found': False, 'time_value': None}
+    
+    def html_to_markdown(self, html_content: str) -> str:
+        """Convert HTML content to Markdown."""
+        return self.html2text_converter.handle(html_content)
+
+
+class FileManager:
+    """Handles file operations and directory management."""
+    
+    def __init__(self, base_dir: str = None):
+        self.base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
+    
+    def create_date_directories(self, date_folder: str) -> Tuple[str, str, str]:
+        """Create directory structure for a given date."""
+        date_dir = os.path.join(self.base_dir, "job-data", date_folder)
+        jobscallme_dir = os.path.join(date_dir, "jobscallme")
+        html_dir = os.path.join(jobscallme_dir, "html")
+        md_dir = os.path.join(jobscallme_dir, "markdown")
+        
+        for directory in [date_dir, jobscallme_dir, html_dir, md_dir]:
+            os.makedirs(directory, exist_ok=True)
+        
+        return html_dir, md_dir, date_dir
+    
+    def save_job_files(self, job_url: str, html_content: str, markdown_content: str, 
+                      html_dir: str, md_dir: str, index_hint: int) -> Dict:
+        """Save job content to HTML and Markdown files."""
+        url_path = job_url.split('/job/')[-1] if '/job/' in job_url else f"job_{index_hint}"
+        html_filename = f"{url_path}.html"
+        md_filename = f"{url_path}.md"
+        
+        # Save HTML content
+        html_output_file = os.path.join(html_dir, html_filename)
+        with open(html_output_file, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        # Save Markdown content
+        md_output_file = os.path.join(md_dir, md_filename)
+        with open(md_output_file, 'w', encoding='utf-8') as f:
+            f.write(markdown_content)
+        
+        return {
+            "html_filename": html_filename,
+            "md_filename": md_filename,
+            "html_length": len(html_content),
+            "md_length": len(markdown_content)
+        }
+    
+    def save_results_summary(self, links: List[str], scraped_jobs: List[Dict], date_folder: str):
+        """Save crawling results summary to JSON files."""
+        date_dir = os.path.join(self.base_dir, "job-data", date_folder)
+        os.makedirs(date_dir, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Save discovered links
+        links_file = os.path.join(date_dir, "jobscall_me_links.json")
+        with open(links_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                "url": "https://www.jobscall.me/job",
+                "timestamp": timestamp,
+                "total_links": len(links),
+                "links": links
+            }, f, indent=2, ensure_ascii=False)
+        
+        print(f"\n💾 Links saved to: {links_file}")
+        
+        # Save scraping summary
+        if scraped_jobs:
+            summary_file = os.path.join(date_dir, "scraping_summary.json")
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "source": "jobscall.me",
+                    "timestamp": timestamp,
+                    "total_jobs": len(scraped_jobs),
+                    "scraped_jobs": scraped_jobs
+                }, f, indent=2, ensure_ascii=False)
+            
+            print(f"💾 Scraping summary saved to: {summary_file}")
+            print(f"📁 HTML files saved in: {os.path.join(date_dir, 'jobscallme', 'html')}")
+            print(f"📁 Markdown files saved in: {os.path.join(date_dir, 'jobscallme', 'markdown')}")
+
+
+class AsyncFirecrawlClient:
+    """Async wrapper for Firecrawl API calls."""
+    
+    def __init__(self, base_url: str, api_key: str = "localhost"):
+        self.base_url = base_url.rstrip('/')
+        self.api_key = api_key
+        self.session = None
+    
+    async def __aenter__(self):
+        connector = aiohttp.TCPConnector(limit=100, limit_per_host=50)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {self.api_key}"}
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def scrape_async(self, url: str) -> Optional[Dict]:
+        """Async scrape method using direct HTTP calls."""
+        try:
+            scrape_url = f"{self.base_url}/v0/scrape"
+            payload = {
+                "url": url,
+                "formats": ["html"]
+            }
+            
+            async with self.session.post(scrape_url, json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return result.get('data', {})
+                else:
+                    print(f"⚠️ HTTP {response.status} for {url}")
+                    return None
+        except asyncio.TimeoutError:
+            print(f"⏰ Timeout scraping {url}")
+            return None
+        except Exception as e:
+            print(f"❌ Error scraping {url}: {str(e)}")
+            return None
+
+
 class JobscallMeCrawler:
-    def __init__(self, base_url: str = None, max_age_days: Optional[int] = None, target_date: Optional[str] = None):
-        # Set default localhost URL if not provided
-        if not base_url:
-            base_url = "http://localhost:3002"  # Default local Firecrawl port
-        
-        # Initialize Firecrawl with localhost URL and dummy API key
-        # For localhost, the API key is not validated but still required by the SDK
-        self.firecrawl = Firecrawl(api_key="localhost", api_url=base_url)
-        
-        # Configurable age cutoff (in days). Controlled only by CLI arg; default None -> fallback to 1 month logic
-        if max_age_days is not None:
-            self.max_age_days = int(max_age_days)
-        else:
-            self.max_age_days = None
-        
-        # Optional specific target date (YYYY-MM-DD) to match job posting date
-        if target_date:
-            try:
-                self.target_date = datetime.date.fromisoformat(target_date)
-            except ValueError:
-                print(f"⚠️  Invalid --target-date '{target_date}'. Expected format YYYY-MM-DD. Ignoring it.")
-                self.target_date = None
-            # When target_date is set, ignore any max_age_days logic during stop decisions
-        else:
-            self.target_date = None
+    """Main crawler class for JobscallMe job postings."""
+    
+    def __init__(self, config: CrawlerConfig = None):
+        self.config = config or CrawlerConfig()
+        self.firecrawl = Firecrawl(api_key="localhost", api_url=self.config.base_url)
+        self.html_processor = HtmlProcessor()
+        self.file_manager = FileManager()
+        self.date_utils = DateUtils()
     
     def map_website(self, url: str) -> Optional[Dict]:
         try:
@@ -71,28 +301,20 @@ class JobscallMeCrawler:
         return all_links
     
     def filter_job_links(self, all_links: List[str]) -> List[str]:
+        """Filter links to only include valid job posting URLs."""
         filtered_links = []
-        
-        # URLs to specifically exclude
-        excluded_urls = [
-            '/job/jobscallmefb'  # Exclude the jobscallmefb URL
-        ]
         
         for link in all_links:
             if '/job/' in link:
                 job_part = link.split('/job/')[-1]
                 
                 # Check if this is a URL we want to exclude
-                should_exclude = False
-                for excluded_url in excluded_urls:
-                    if excluded_url in link:
-                        should_exclude = True
-                        print(f"🚫 Excluding specific URL: {link}")
-                        break
-                
+                should_exclude = any(excluded_url in link for excluded_url in self.config.excluded_urls)
                 if should_exclude:
+                    print(f"🚫 Excluding specific URL: {link}")
                     continue
                 
+                # Include valid job URLs
                 if (job_part and 
                     '/' not in job_part and 
                     not link.endswith('/job/') and
@@ -102,55 +324,9 @@ class JobscallMeCrawler:
         
         return filtered_links
     
-    def is_job_too_old(self, time_value: str) -> bool:
-        """
-        Check if a job posting is older than the configured cutoff.
-        If no cutoff is configured, falls back to "older than 1 month".
-        
-        Args:
-            time_value (str): Time value from the job posting
-            
-        Returns:
-            bool: True if job is older than cutoff, False otherwise
-        """
-        try:
-            # Parse the time value
-            job_date = parser.parse(time_value)
-            
-            # Get current date
-            current_date = datetime.datetime.now()
-            
-            # Determine cutoff
-            if self.max_age_days is not None:
-                cutoff_date = current_date - datetime.timedelta(days=self.max_age_days)
-                cutoff_desc = f"last {self.max_age_days} days"
-            else:
-                cutoff_date = current_date - relativedelta(months=1)
-                cutoff_desc = "the last month"
-            
-            # Check if job date is older than cutoff
-            is_old = job_date < cutoff_date
-            
-            if is_old:
-                print(
-                    f"📅 Job date {job_date.strftime('%Y-%m-%d')} is older than cutoff {cutoff_date.strftime('%Y-%m-%d')} ({cutoff_desc})"
-                )
-            else:
-                print(
-                    f"📅 Job date {job_date.strftime('%Y-%m-%d')} is within {cutoff_desc}"
-                )
-            
-            return is_old
-            
-        except Exception as e:
-            print(f"⚠️ Could not parse date '{time_value}': {e}")
-            # If we can't parse the date, assume it's not too old and continue
-            return False
-    
     def crawl_jobscall_me(self) -> Optional[List[str]]:
-        target_url = "https://www.jobscall.me/job"
-        
-        map_result = self.map_website(target_url)
+        """Discover job links from the main job listing page."""
+        map_result = self.map_website(self.config.target_site_url)
         if not map_result:
             return None
         
@@ -173,126 +349,114 @@ class JobscallMeCrawler:
         for i, link in enumerate(links, 1):
             print(f"{i:3d}. {link}")
     
-    def scrape_job_page(self, url: str) -> Optional[str]:
-        """
-        Scrape individual job page to get raw HTML content
-        
-        Args:
-            url (str): URL of the job page to scrape
+    def _extract_html_content(self, scrape_result) -> Optional[str]:
+        """Extract HTML content from Firecrawl scrape result."""
+        if isinstance(scrape_result, dict) and 'html' in scrape_result:
+            print(f"✅ Found html key in dict")
+            return scrape_result['html']
+        elif hasattr(scrape_result, 'html') and scrape_result.html:
+            print(f"✅ Found html attribute with content")
+            return scrape_result.html
+        elif hasattr(scrape_result, 'raw_html') and scrape_result.raw_html:
+            print(f"✅ Found raw_html attribute with content")
+            return scrape_result.raw_html
+        else:
+            print(f"⚠️ No HTML content found")
+            return None
+    
+    def _should_stop_crawling(self, time_value: str, job_date: datetime.date) -> Tuple[bool, bool]:
+        """Determine if crawling should stop and if job matches criteria."""
+        if self.config.target_date is not None:
+            matches = (job_date == self.config.target_date) if job_date else False
+            if not matches:
+                print(f"⏭️  Skipping job not on target date {self.config.target_date} (found: {job_date})")
+            return False, matches  # Never stop early in target date mode
+        else:
+            # Check age cutoff
+            if DateUtils.is_job_too_old(time_value, self.config.max_age_days):
+                cutoff_desc = f"{self.config.max_age_days} days" if self.config.max_age_days else "1 month"
+                print(f"🛑 Job posting is older than cutoff ({cutoff_desc}) - stopping crawl")
+                return True, False
+            return False, True
+    
+    async def scrape_job_page_async(self, client: AsyncFirecrawlClient, url: str) -> Optional[Dict]:
+        """Async scrape individual job page and extract content with metadata."""
+        try:
+            scrape_result = await client.scrape_async(url)
             
-        Returns:
-            str: Raw HTML content from the page
-        """
+            if not scrape_result:
+                return None
+            
+            html_content = self._extract_html_content(scrape_result)
+            if not html_content:
+                return None
+            
+            # Process HTML content
+            processed_result = self.html_processor.extract_article_content(html_content)
+            
+            # Handle date logic if time value is found
+            if processed_result.get('time_value'):
+                try:
+                    parsed_dt = parser.parse(processed_result['time_value'])
+                    job_date = parsed_dt.date()
+                    processed_result['job_date'] = job_date.isoformat()
+                    
+                    stop_crawling, matches_criteria = self._should_stop_crawling(
+                        processed_result['time_value'], job_date
+                    )
+                    processed_result['stop_crawling'] = stop_crawling
+                    processed_result['matches_target_date'] = matches_criteria
+                except Exception:
+                    processed_result['stop_crawling'] = False
+                    processed_result['matches_target_date'] = self.config.target_date is None
+            else:
+                processed_result['stop_crawling'] = False
+                processed_result['matches_target_date'] = self.config.target_date is None
+            
+            return processed_result
+            
+        except Exception as e:
+            print(f"❌ Failed to scrape {url}: {str(e)}")
+            return None
+    
+    def scrape_job_page(self, url: str) -> Optional[Dict]:
+        """Synchronous wrapper for backward compatibility."""
         try:
             print(f"📄 Scraping job page: {url}")
-            
-            # Use Firecrawl's scrape method to extract content with HTML format
-            # According to docs: https://docs.firecrawl.dev/sdks/python#scraping-a-url
             scrape_result = self.firecrawl.scrape(url=url, formats=['html'])
             
-            # Debug: Print available attributes
-            print(f"🔍 Scrape result type: {type(scrape_result)}")
-            
-            # Get HTML content from the result
-            if scrape_result:
-                # Extract the full HTML content first
-                html_content = None
-                
-                # Check if it's a dictionary with html key
-                if isinstance(scrape_result, dict) and 'html' in scrape_result:
-                    print(f"✅ Found html key in dict")
-                    html_content = scrape_result['html']
-                # Check if it has html attribute
-                elif hasattr(scrape_result, 'html') and scrape_result.html:
-                    print(f"✅ Found html attribute with content")
-                    html_content = scrape_result.html
-                # Check for raw_html attribute
-                elif hasattr(scrape_result, 'raw_html') and scrape_result.raw_html:
-                    print(f"✅ Found raw_html attribute with content")
-                    html_content = scrape_result.raw_html
-                else:
-                    print(f"⚠️ No HTML content found")
-                    print(f"🔍 Result structure: {type(scrape_result)}")
-                    if isinstance(scrape_result, dict):
-                        print(f"🔍 Available dict keys: {list(scrape_result.keys())}")
-                    else:
-                        print(f"🔍 Available attributes: {dir(scrape_result)}")
-                    return None
-                
-                # Extract only the content within <article> tags and get time value
-                if html_content:
-                    try:
-                        soup = BeautifulSoup(html_content, 'html.parser')
-                        article = soup.find('article')
-                        
-                        # Create a result object with metadata
-                        result = {
-                            'html_content': None,
-                            'article_found': False,
-                            'time_value': None
-                        }
-                        
-                        if article:
-                            print(f"✅ Found <article> tag, extracting content")
-                            # Store the article content
-                            result['html_content'] = str(article)
-                            result['article_found'] = True
-                            
-                            # Try to extract time value from within the article
-                            time_tag = article.find('time')
-                            if time_tag:
-                                # Get the datetime attribute if available, otherwise use the text content
-                                time_value = time_tag.get('datetime', time_tag.text.strip())
-                                result['time_value'] = time_value
-                                print(f"✅ Found <time> tag: {time_value}")
-                                
-                                # Parse job date for further checks
-                                try:
-                                    parsed_dt = parser.parse(time_value)
-                                    job_dt = parsed_dt.date()
-                                    result['job_date'] = job_dt.isoformat()
-                                except Exception:
-                                    job_dt = None
-                                
-                                if self.target_date is not None:
-                                    # Only keep jobs that match the specified date; never stop early when target-date is used
-                                    matches = (job_dt == self.target_date) if job_dt else False
-                                    result['matches_target_date'] = matches
-                                    if not matches:
-                                        print(
-                                            f"⏭️  Skipping job not on target date {self.target_date} (found: {job_dt})"
-                                        )
-                                    result['stop_crawling'] = False
-                                else:
-                                    # Check cutoff/age logic only when no target date is specified
-                                    if self.is_job_too_old(time_value):
-                                        cutoff_desc = (
-                                            f"{self.max_age_days} days" if self.max_age_days is not None else "1 month"
-                                        )
-                                        print(f"🛑 Job posting is older than cutoff ({cutoff_desc}) - stopping crawl")
-                                        result['stop_crawling'] = True
-                                    else:
-                                        result['stop_crawling'] = False
-                            else:
-                                print(f"⚠️ No <time> tag found within article")
-                                # If target date is set but no time tag, we can't confirm the date -> skip
-                                if self.target_date is not None:
-                                    result['matches_target_date'] = False
-                                result['stop_crawling'] = False
-                        else:
-                            print(f"⚠️ No <article> tag found, returning full HTML")
-                            result['html_content'] = html_content
-                        
-                        return result
-                    except Exception as e:
-                        print(f"❌ Error parsing HTML: {str(e)}")
-                        return {'html_content': html_content, 'article_found': False, 'time_value': None}
-                
-                return html_content
-            else:
+            if not scrape_result:
                 print(f"⚠️ No content found for: {url}")
                 return None
-                
+            
+            html_content = self._extract_html_content(scrape_result)
+            if not html_content:
+                return None
+            
+            # Process HTML content
+            processed_result = self.html_processor.extract_article_content(html_content)
+            
+            # Handle date logic if time value is found
+            if processed_result.get('time_value'):
+                try:
+                    parsed_dt = parser.parse(processed_result['time_value'])
+                    job_date = parsed_dt.date()
+                    processed_result['job_date'] = job_date.isoformat()
+                    
+                    stop_crawling, matches_criteria = self._should_stop_crawling(
+                        processed_result['time_value'], job_date
+                    )
+                    processed_result['stop_crawling'] = stop_crawling
+                    processed_result['matches_target_date'] = matches_criteria
+                except Exception:
+                    processed_result['stop_crawling'] = False
+                    processed_result['matches_target_date'] = self.config.target_date is None
+            else:
+                processed_result['stop_crawling'] = False
+                processed_result['matches_target_date'] = self.config.target_date is None
+            
+            return processed_result
+            
         except ConnectionError as e:
             print(f"❌ Connection failed for {url}: {str(e)}")
             print("ℹ️  Make sure your local Firecrawl instance is running")
@@ -301,113 +465,185 @@ class JobscallMeCrawler:
             print(f"❌ Failed to scrape {url}: {str(e)}")
             return None
     
-    def html_to_markdown(self, html_content: str) -> str:
-        """
-        Convert HTML content to Markdown
-        
-        Args:
-            html_content (str): HTML content to convert
-            
-        Returns:
-            str: Converted Markdown content
-        """
-        # Configure html2text
-        h = html2text.HTML2Text()
-        h.ignore_links = False
-        h.ignore_images = False
-        h.ignore_tables = False
-        h.body_width = 0  # Don't wrap text at a certain width
-        
-        # Convert HTML to Markdown
-        markdown_content = h.handle(html_content)
-        
-        return markdown_content
     
-    def scrape_all_jobs(self, job_links: List[str], max_jobs: int = 500) -> List[Dict]:
-        """
-        Scrape all discovered job pages and save as HTML and Markdown files
-        
-        Args:
-            job_links (List[str]): List of job URLs to scrape
-            max_jobs (int): Maximum number of jobs to scrape (default: 500)
-            
-        Returns:
-            List[Dict]: List of scraped job information
-        """
+    async def scrape_all_jobs_async(self, job_links: List[str]) -> Tuple[List[Dict], str]:
+        """Async version - significantly faster for scraping multiple jobs."""
         scraped_jobs = []
-        jobs_to_scrape = job_links[:max_jobs]
+        jobs_to_scrape = job_links[:self.config.max_jobs]
         
-        print(f"\n🔍 Starting to scrape {len(jobs_to_scrape)} job pages...")
+        print(f"\n🚀 Starting ASYNC scrape of {len(jobs_to_scrape)} job pages...")
         
         # Get current date for folder structure
         today = datetime.datetime.now()
         date_folder = today.strftime("%Y%m%d")
         
-        # Create directory structure (with new folder structure: job-data/{YYYYMMDD}/jobscallme/)
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        date_dir = os.path.join(script_dir, "job-data", date_folder)
-        jobscallme_dir = os.path.join(date_dir, "jobscallme")
-        html_dir = os.path.join(jobscallme_dir, "html")
-        md_dir = os.path.join(jobscallme_dir, "markdown")
+        # Create directory structure
+        html_dir, md_dir, date_dir = self.file_manager.create_date_directories(date_folder)
         
-        # Create directories if they don't exist
-        os.makedirs(date_dir, exist_ok=True)
-        os.makedirs(jobscallme_dir, exist_ok=True)
-        os.makedirs(html_dir, exist_ok=True)
-        os.makedirs(md_dir, exist_ok=True)
+        total = len(jobs_to_scrape)
+        print(f"\n🚦 Processing {total} jobs with async concurrency={self.config.concurrency}...")
         
-        for i, job_url in enumerate(jobs_to_scrape, 1):
-            print(f"\n[{i}/{len(jobs_to_scrape)}] Processing: {job_url}")
+        # Create semaphore to limit concurrent requests
+        semaphore = asyncio.Semaphore(self.config.concurrency)
+        
+        async def scrape_with_semaphore(client: AsyncFirecrawlClient, url: str, index: int):
+            async with semaphore:
+                result = await self.scrape_job_page_async(client, url)
+                if result:
+                    print(f"\n[{index+1}/{total}] ✅ Completed: {url}")
+                else:
+                    print(f"\n[{index+1}/{total}] ❌ Failed: {url}")
+                return url, result, index
+        
+        def save_result(job_url: str, result: Dict, index_hint: int):
+            nonlocal scraped_jobs
+            # If target date mode is active, skip saving non-matching jobs
+            if self.config.target_date is not None and not result.get('matches_target_date', False):
+                return
             
-            result = self.scrape_job_page(job_url)
-            if result and isinstance(result, dict) and result.get('html_content'):
-                # Check if we should stop crawling due to old job
-                if result.get('stop_crawling', False):
-                    print(f"🛑 Stopping crawl - encountered job older than 1 month")
+            html_content = result['html_content']
+            markdown_content = self.html_processor.html_to_markdown(html_content)
+            
+            # Save files and get metadata
+            file_info = self.file_manager.save_job_files(
+                job_url, html_content, markdown_content, html_dir, md_dir, index_hint
+            )
+            
+            # Create job info with metadata
+            job_info = {
+                "url": job_url,
+                **file_info,
+                "article_found": result.get('article_found', False)
+            }
+            
+            # Add time value if available
+            if result.get('time_value'):
+                job_info["time_value"] = result['time_value']
+            if result.get('job_date'):
+                job_info["job_date"] = result['job_date']
+            
+            scraped_jobs.append(job_info)
+            print(f"✅ Saved: {file_info['html_filename']} / {file_info['md_filename']}")
+        
+        # Use async context manager for HTTP client
+        async with AsyncFirecrawlClient(self.config.base_url) as client:
+            # Create all tasks
+            tasks = [
+                scrape_with_semaphore(client, url, idx) 
+                for idx, url in enumerate(jobs_to_scrape)
+            ]
+            
+            # Process results as they complete
+            should_stop = False
+            for coro in asyncio.as_completed(tasks):
+                if should_stop:
                     break
-                
-                # If target date mode is active, skip saving non-matching jobs
-                if self.target_date is not None and not result.get('matches_target_date', False):
+                    
+                try:
+                    job_url, result, idx = await coro
+                    
+                    if result and isinstance(result, dict) and result.get('html_content'):
+                        # Early stop only when not in target-date mode
+                        if result.get('stop_crawling', False) and self.config.target_date is None:
+                            cutoff_desc = f"{self.config.max_age_days} days" if self.config.max_age_days else "1 month"
+                            print(f"🛑 Stopping crawl - encountered job older than {cutoff_desc}")
+                            should_stop = True
+                            # Cancel remaining tasks
+                            for task in tasks:
+                                if not task.done():
+                                    task.cancel()
+                            break
+                        
+                        save_result(job_url, result, idx)
+                        
+                except Exception as e:
+                    print(f"❌ Error processing result: {e}")
                     continue
+        
+        print(f"\n📊 Async Scraping Summary:")
+        print(f"   Successfully scraped: {len(scraped_jobs)}/{len(jobs_to_scrape)} jobs")
+        
+        return scraped_jobs, date_folder
+    
+    def scrape_all_jobs(self, job_links: List[str]) -> Tuple[List[Dict], str]:
+        """Main scraping method - uses async for better performance."""
+        # Run the async version
+        return asyncio.run(self.scrape_all_jobs_async(job_links))
+    
+    def scrape_all_jobs_sync(self, job_links: List[str]) -> Tuple[List[Dict], str]:
+        """Synchronous fallback version (slower but more compatible)."""
+        scraped_jobs = []
+        jobs_to_scrape = job_links[:self.config.max_jobs]
+        
+        print(f"\n🔍 Starting SYNC scrape of {len(jobs_to_scrape)} job pages...")
+        
+        # Get current date for folder structure
+        today = datetime.datetime.now()
+        date_folder = today.strftime("%Y%m%d")
+        
+        # Create directory structure
+        html_dir, md_dir, date_dir = self.file_manager.create_date_directories(date_folder)
+        
+        total = len(jobs_to_scrape)
+        print(f"\n🚦 Submitting {total} jobs with concurrency={self.config.concurrency}...")
+        processed = 0
+        
+        def save_result(job_url: str, result: Dict, index_hint: int):
+            nonlocal scraped_jobs
+            # If target date mode is active, skip saving non-matching jobs
+            if self.config.target_date is not None and not result.get('matches_target_date', False):
+                return
+            
+            html_content = result['html_content']
+            markdown_content = self.html_processor.html_to_markdown(html_content)
+            
+            # Save files and get metadata
+            file_info = self.file_manager.save_job_files(
+                job_url, html_content, markdown_content, html_dir, md_dir, index_hint
+            )
+            
+            # Create job info with metadata
+            job_info = {
+                "url": job_url,
+                **file_info,
+                "article_found": result.get('article_found', False)
+            }
+            
+            # Add time value if available
+            if result.get('time_value'):
+                job_info["time_value"] = result['time_value']
+            if result.get('job_date'):
+                job_info["job_date"] = result['job_date']
+            
+            scraped_jobs.append(job_info)
+            print(f"✅ Saved: {file_info['html_filename']} / {file_info['md_filename']}")
+        
+        with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
+            future_to_url = {executor.submit(self.scrape_job_page, url): url for url in jobs_to_scrape}
+            for idx, future in enumerate(as_completed(future_to_url), 1):
+                job_url = future_to_url[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    print(f"❌ Error scraping {job_url}: {e}")
+                    continue
+                processed += 1
+                print(f"\n[{processed}/{total}] Completed: {job_url}")
                 
-                # Extract filename from URL path
-                url_path = job_url.split('/job/')[-1] if '/job/' in job_url else f"job_{i}"
-                html_filename = f"{url_path}.html"
-                md_filename = f"{url_path}.md"
-                
-                html_content = result['html_content']
-                
-                # Save HTML content
-                html_output_file = os.path.join(html_dir, html_filename)
-                with open(html_output_file, 'w', encoding='utf-8') as f:
-                    f.write(html_content)
-                
-                # Convert to Markdown and save
-                markdown_content = self.html_to_markdown(html_content)
-                md_output_file = os.path.join(md_dir, md_filename)
-                with open(md_output_file, 'w', encoding='utf-8') as f:
-                    f.write(markdown_content)
-                
-                # Create job info with metadata
-                job_info = {
-                    "url": job_url,
-                    "html_filename": html_filename,
-                    "md_filename": md_filename,
-                    "html_length": len(html_content),
-                    "md_length": len(markdown_content),
-                    "article_found": result.get('article_found', False)
-                }
-                
-                # Add time value if available
-                if result.get('time_value'):
-                    job_info["time_value"] = result['time_value']
-                
-                scraped_jobs.append(job_info)
-                
-                print(f"✅ Saved HTML: {html_filename}")
-                print(f"✅ Saved Markdown: {md_filename}")
-            else:
-                print(f"❌ Failed to extract HTML content from: {job_url}")
+                if result and isinstance(result, dict) and result.get('html_content'):
+                    # Early stop only when not in target-date mode
+                    if result.get('stop_crawling', False) and self.config.target_date is None:
+                        cutoff_desc = f"{self.config.max_age_days} days" if self.config.max_age_days else "1 month"
+                        print(f"🛑 Stopping crawl - encountered job older than {cutoff_desc}")
+                        # Cancel remaining futures
+                        for f in future_to_url:
+                            if not f.done():
+                                f.cancel()
+                        break
+                    
+                    save_result(job_url, result, idx)
+                else:
+                    print(f"❌ Failed to extract HTML content from: {job_url}")
         
         print(f"\n📊 Scraping Summary:")
         print(f"   Successfully scraped: {len(scraped_jobs)}/{len(jobs_to_scrape)} jobs")
@@ -415,54 +651,11 @@ class JobscallMeCrawler:
         return scraped_jobs, date_folder
     
     def save_results(self, links: List[str], scraped_jobs: List[Dict] = None, date_folder: str = None):
-        """
-        Save results to date-based directory structure
-        
-        Args:
-            links (List[str]): List of discovered links
-            scraped_jobs (List[Dict]): List of scraped job information
-            date_folder (str): Date folder name (format: YYYYMMDD)
-        """
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # If date_folder is not provided, use today's date
+        """Save results using the file manager."""
         if not date_folder:
-            today = datetime.datetime.now()
-            date_folder = today.strftime("%Y%m%d")
+            date_folder = datetime.datetime.now().strftime("%Y%m%d")
         
-        # Create date directory if it doesn't exist
-        date_dir = os.path.join(script_dir, "job-data", date_folder)
-        os.makedirs(date_dir, exist_ok=True)
-        
-        # Format current timestamp
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Save discovered links
-        links_file = os.path.join(date_dir, "jobscall_me_links.json")
-        with open(links_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                "url": "https://www.jobscall.me/job",
-                "timestamp": timestamp,
-                "total_links": len(links),
-                "links": links
-            }, f, indent=2, ensure_ascii=False)
-        
-        print(f"\n💾 Links saved to: {links_file}")
-        
-        # Save scraping summary if available
-        if scraped_jobs:
-            summary_file = os.path.join(date_dir, "scraping_summary.json")
-            with open(summary_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "source": "jobscall.me",
-                    "timestamp": timestamp,
-                    "total_jobs": len(scraped_jobs),
-                    "scraped_jobs": scraped_jobs
-                }, f, indent=2, ensure_ascii=False)
-            
-            print(f"💾 Scraping summary saved to: {summary_file}")
-            print(f"📁 HTML files saved in: {os.path.join(date_dir, 'jobscallme', 'html')}")
-            print(f"📁 Markdown files saved in: {os.path.join(date_dir, 'jobscallme', 'markdown')}")
+        self.file_manager.save_results_summary(links, scraped_jobs or [], date_folder)
 
 
 def get_base_url() -> str:
@@ -478,38 +671,49 @@ def get_base_url() -> str:
 
 
 def main():
-    # CLI args
+    """Main function to run the JobscallMe crawler."""
     parser_obj = argparse.ArgumentParser(description="Crawl jobscall.me and scrape jobs")
     parser_obj.add_argument(
         "--max-age-days",
         type=int,
         default=None,
-        help=(
-            "Cutoff in days for job recency (e.g., 14). "
-            "If not set, defaults to 1-month cutoff."
-        ),
+        help="Cutoff in days for job recency (e.g., 14). If not set, defaults to 1-month cutoff."
     )
     parser_obj.add_argument(
         "--target-date",
         type=str,
         default=None,
-        help=(
-            "Only crawl jobs posted on this specific date (YYYY-MM-DD). "
-            "When provided, overrides --max-age-days and does not stop early."
-        ),
+        help="Only crawl jobs posted on this specific date (YYYY-MM-DD). When provided, overrides --max-age-days and does not stop early."
+    )
+    parser_obj.add_argument(
+        "--concurrency",
+        type=int,
+        default=5,
+        help="Number of concurrent workers for scraping (default: 5). Increase to speed up scraping; be mindful of server limits."
     )
     args = parser_obj.parse_args()
 
     base_url = get_base_url()
     
-    # Initialize crawler with localhost URL (no API key needed)
-    crawler = JobscallMeCrawler(base_url, max_age_days=args.max_age_days, target_date=args.target_date)
-    if crawler.target_date is not None:
-        print(f"ℹ️  Target date mode: only jobs from {crawler.target_date.isoformat()} will be saved")
-    elif crawler.max_age_days is not None:
-        print(f"ℹ️  Using cutoff: last {crawler.max_age_days} days (--max-age-days)")
+    # Create configuration
+    config = CrawlerConfig(
+        base_url=base_url,
+        max_age_days=args.max_age_days,
+        target_date=DateUtils.parse_target_date(args.target_date),
+        concurrency=args.concurrency
+    )
+    
+    # Initialize crawler
+    crawler = JobscallMeCrawler(config)
+    
+    # Display configuration
+    if config.target_date is not None:
+        print(f"ℹ️  Target date mode: only jobs from {config.target_date.isoformat()} will be saved")
+    elif config.max_age_days is not None:
+        print(f"ℹ️  Using cutoff: last {config.max_age_days} days (--max-age-days)")
     else:
         print("ℹ️  Using default cutoff: last 1 month")
+    print(f"ℹ️  Concurrency: {config.concurrency} workers")
     
     # Step 1: Map and discover job links
     print("🚀 Step 1: Mapping website to discover job links...")
@@ -523,7 +727,7 @@ def main():
     
     # Step 2: Scrape individual job pages
     print("\n🚀 Step 2: Scraping individual job pages...")
-    scraped_jobs, date_folder = crawler.scrape_all_jobs(links, max_jobs=500)
+    scraped_jobs, date_folder = crawler.scrape_all_jobs(links)
     
     # Step 3: Save results
     print("\n🚀 Step 3: Saving results...")
