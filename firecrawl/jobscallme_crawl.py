@@ -1,6 +1,7 @@
 import json
 import os
 import datetime
+import argparse
 from typing import Dict, List, Optional
 from firecrawl import Firecrawl
 from bs4 import BeautifulSoup
@@ -10,7 +11,7 @@ from dateutil.relativedelta import relativedelta
 
 
 class JobscallMeCrawler:
-    def __init__(self, base_url: str = None):
+    def __init__(self, base_url: str = None, max_age_days: Optional[int] = None, target_date: Optional[str] = None):
         # Set default localhost URL if not provided
         if not base_url:
             base_url = "http://localhost:3002"  # Default local Firecrawl port
@@ -18,6 +19,23 @@ class JobscallMeCrawler:
         # Initialize Firecrawl with localhost URL and dummy API key
         # For localhost, the API key is not validated but still required by the SDK
         self.firecrawl = Firecrawl(api_key="localhost", api_url=base_url)
+        
+        # Configurable age cutoff (in days). Controlled only by CLI arg; default None -> fallback to 1 month logic
+        if max_age_days is not None:
+            self.max_age_days = int(max_age_days)
+        else:
+            self.max_age_days = None
+        
+        # Optional specific target date (YYYY-MM-DD) to match job posting date
+        if target_date:
+            try:
+                self.target_date = datetime.date.fromisoformat(target_date)
+            except ValueError:
+                print(f"⚠️  Invalid --target-date '{target_date}'. Expected format YYYY-MM-DD. Ignoring it.")
+                self.target_date = None
+            # When target_date is set, ignore any max_age_days logic during stop decisions
+        else:
+            self.target_date = None
     
     def map_website(self, url: str) -> Optional[Dict]:
         try:
@@ -86,13 +104,14 @@ class JobscallMeCrawler:
     
     def is_job_too_old(self, time_value: str) -> bool:
         """
-        Check if a job posting is over 1 month old
+        Check if a job posting is older than the configured cutoff.
+        If no cutoff is configured, falls back to "older than 1 month".
         
         Args:
             time_value (str): Time value from the job posting
             
         Returns:
-            bool: True if job is over 1 month old, False otherwise
+            bool: True if job is older than cutoff, False otherwise
         """
         try:
             # Parse the time value
@@ -101,16 +120,25 @@ class JobscallMeCrawler:
             # Get current date
             current_date = datetime.datetime.now()
             
-            # Calculate 1 month ago
-            one_month_ago = current_date - relativedelta(months=1)
+            # Determine cutoff
+            if self.max_age_days is not None:
+                cutoff_date = current_date - datetime.timedelta(days=self.max_age_days)
+                cutoff_desc = f"last {self.max_age_days} days"
+            else:
+                cutoff_date = current_date - relativedelta(months=1)
+                cutoff_desc = "the last month"
             
-            # Check if job date is older than 1 month
-            is_old = job_date < one_month_ago
+            # Check if job date is older than cutoff
+            is_old = job_date < cutoff_date
             
             if is_old:
-                print(f"📅 Job date {job_date.strftime('%Y-%m-%d')} is older than {one_month_ago.strftime('%Y-%m-%d')}")
+                print(
+                    f"📅 Job date {job_date.strftime('%Y-%m-%d')} is older than cutoff {cutoff_date.strftime('%Y-%m-%d')} ({cutoff_desc})"
+                )
             else:
-                print(f"📅 Job date {job_date.strftime('%Y-%m-%d')} is within the last month")
+                print(
+                    f"📅 Job date {job_date.strftime('%Y-%m-%d')} is within {cutoff_desc}"
+                )
             
             return is_old
             
@@ -218,14 +246,38 @@ class JobscallMeCrawler:
                                 result['time_value'] = time_value
                                 print(f"✅ Found <time> tag: {time_value}")
                                 
-                                # Check if the job posting is over 1 month old
-                                if self.is_job_too_old(time_value):
-                                    print(f"🛑 Job posting is over 1 month old - stopping crawl")
-                                    result['stop_crawling'] = True
-                                else:
+                                # Parse job date for further checks
+                                try:
+                                    parsed_dt = parser.parse(time_value)
+                                    job_dt = parsed_dt.date()
+                                    result['job_date'] = job_dt.isoformat()
+                                except Exception:
+                                    job_dt = None
+                                
+                                if self.target_date is not None:
+                                    # Only keep jobs that match the specified date; never stop early when target-date is used
+                                    matches = (job_dt == self.target_date) if job_dt else False
+                                    result['matches_target_date'] = matches
+                                    if not matches:
+                                        print(
+                                            f"⏭️  Skipping job not on target date {self.target_date} (found: {job_dt})"
+                                        )
                                     result['stop_crawling'] = False
+                                else:
+                                    # Check cutoff/age logic only when no target date is specified
+                                    if self.is_job_too_old(time_value):
+                                        cutoff_desc = (
+                                            f"{self.max_age_days} days" if self.max_age_days is not None else "1 month"
+                                        )
+                                        print(f"🛑 Job posting is older than cutoff ({cutoff_desc}) - stopping crawl")
+                                        result['stop_crawling'] = True
+                                    else:
+                                        result['stop_crawling'] = False
                             else:
                                 print(f"⚠️ No <time> tag found within article")
+                                # If target date is set but no time tag, we can't confirm the date -> skip
+                                if self.target_date is not None:
+                                    result['matches_target_date'] = False
                                 result['stop_crawling'] = False
                         else:
                             print(f"⚠️ No <article> tag found, returning full HTML")
@@ -313,6 +365,10 @@ class JobscallMeCrawler:
                 if result.get('stop_crawling', False):
                     print(f"🛑 Stopping crawl - encountered job older than 1 month")
                     break
+                
+                # If target date mode is active, skip saving non-matching jobs
+                if self.target_date is not None and not result.get('matches_target_date', False):
+                    continue
                 
                 # Extract filename from URL path
                 url_path = job_url.split('/job/')[-1] if '/job/' in job_url else f"job_{i}"
@@ -422,10 +478,38 @@ def get_base_url() -> str:
 
 
 def main():
+    # CLI args
+    parser_obj = argparse.ArgumentParser(description="Crawl jobscall.me and scrape jobs")
+    parser_obj.add_argument(
+        "--max-age-days",
+        type=int,
+        default=None,
+        help=(
+            "Cutoff in days for job recency (e.g., 14). "
+            "If not set, defaults to 1-month cutoff."
+        ),
+    )
+    parser_obj.add_argument(
+        "--target-date",
+        type=str,
+        default=None,
+        help=(
+            "Only crawl jobs posted on this specific date (YYYY-MM-DD). "
+            "When provided, overrides --max-age-days and does not stop early."
+        ),
+    )
+    args = parser_obj.parse_args()
+
     base_url = get_base_url()
     
     # Initialize crawler with localhost URL (no API key needed)
-    crawler = JobscallMeCrawler(base_url)
+    crawler = JobscallMeCrawler(base_url, max_age_days=args.max_age_days, target_date=args.target_date)
+    if crawler.target_date is not None:
+        print(f"ℹ️  Target date mode: only jobs from {crawler.target_date.isoformat()} will be saved")
+    elif crawler.max_age_days is not None:
+        print(f"ℹ️  Using cutoff: last {crawler.max_age_days} days (--max-age-days)")
+    else:
+        print("ℹ️  Using default cutoff: last 1 month")
     
     # Step 1: Map and discover job links
     print("🚀 Step 1: Mapping website to discover job links...")
